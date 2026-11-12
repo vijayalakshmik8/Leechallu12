@@ -1,0 +1,8 @@
+pyrogram
+tgcrypto
+aiohttp
+git+https://github.com/yt-dlp/yt-dlp.git
+ffmpeg-python
+pytz
+requests
+beautifulsoup4
