@@ -10,6 +10,7 @@ import re
 import pytz
 import glob
 import tempfile
+import shutil
 from datetime import datetime, timedelta
 from urllib.parse import urlparse
 from pyrogram import Client, filters, idle
@@ -18,7 +19,7 @@ from pyrogram.errors import UserNotParticipant
 import yt_dlp
 from aiohttp import web
 from leech import register_leech_handlers
-from youtube_formats import compatible_video_formats, selected_video_height, youtube_format_for_height
+from youtube_formats import available_video_heights, compatible_video_formats, selected_video_height, youtube_format_for_height
 
 # Logging Setup
 logging.basicConfig(level=logging.INFO)
@@ -1430,7 +1431,7 @@ async def auto_media_link(client: Client, message: Message):
                 thumbnail_url = info.get('thumbnail')
                 duration = info.get('duration') or 0
 
-                resolutions = [144, 240, 360, 480, 576, 720, 1080, 1440, 2160]
+                resolutions = available_video_heights(formats)
                 quality_buttons = []
 
                 audio_formats = [
@@ -1450,7 +1451,11 @@ async def auto_media_link(client: Client, message: Message):
 
                     selected = max(
                         matching_formats,
-                        key=lambda f: (f.get('tbr') or 0, get_format_size(f, duration))
+                        key=lambda f: (
+                            f.get('height') or 0,
+                            f.get('tbr') or 0,
+                            get_format_size(f, duration),
+                        )
                     )
 
                     video_size = get_format_size(selected, duration)
@@ -1663,7 +1668,15 @@ async def process_download(client, status_msg, user_id, user_name, url, custom_n
             res_val = int(quality)
             with yt_dlp.YoutubeDL({**common_ydl_opts, 'skip_download': True}) as ydl_check:
                 available_info = ydl_check.extract_info(url, download=False)
-            fmt_selector = youtube_format_for_height(available_info.get('formats', []), res_val)
+            if not available_info.get('formats') and available_info.get('entries'):
+                available_info = next(
+                    (entry for entry in available_info['entries'] if entry and entry.get('formats')),
+                    available_info,
+                )
+            fmt_selector = youtube_format_for_height(
+                available_info.get('formats', []), res_val,
+                can_merge=bool(shutil.which('ffmpeg')),
+            )
             ydl_opts = {
                 **common_ydl_opts,
                 'format': fmt_selector,
