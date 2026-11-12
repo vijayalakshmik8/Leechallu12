@@ -1102,11 +1102,8 @@ async def leech_command_handler(client: Client, message: Message):
     
     if len(command_parts) < 2:
         await message.reply_text(
-            "❌ **Please provide a link!**\n\n"
-            "**Usage Examples:**\n"
-            "• `/leech https://t.me/channel/123`\n"
-            "• `/leech <url> -n CustomName.mp4`\n"
-            "• `/leech <url> -t <thumb_url_or_telegram_link>`"
+            "❌ Please provide a link or reply to a message/media!\\n\\n"
+            "Example: `/leech https://... -n video.mp4 -t thumbnail_url`"
         )
         return
 
@@ -1697,7 +1694,11 @@ async def process_download(client, status_msg, user_id, user_name, url, custom_n
                 if os.path.exists(file_path):
                     downloaded_files.append(file_path)
 
-            original_title = info_dict.get('title', 'Media')
+            original_title = (
+                os.path.splitext(os.path.basename(downloaded_files[0]))[0]
+                if custom_name and downloaded_files
+                else info_dict.get('title', 'Media')
+            )
 
             if not yt_thumb_path:
                 thumb_url_fallback = info_dict.get('thumbnail')
@@ -1713,6 +1714,28 @@ async def process_download(client, status_msg, user_id, user_name, url, custom_n
 
         if not downloaded_files:
             raise Exception("No media files found to download!")
+
+        # Apply -n to the actual downloaded file(s). This works for direct
+        # HTTP/CDN links as well as extractor-supported links.
+        if custom_name:
+            requested_name = os.path.basename(str(custom_name).strip())
+            requested_name = re.sub(r'[\\x00-\\x1f<>:"/\\\\|?*]', "_", requested_name).strip(" .")
+            if requested_name:
+                renamed_files = []
+                for index, old_path in enumerate(downloaded_files, start=1):
+                    old_ext = os.path.splitext(old_path)[1]
+                    requested_root, requested_ext = os.path.splitext(requested_name)
+                    if requested_ext:
+                        target_name = requested_name if len(downloaded_files) == 1 else f"{requested_root}_{index}{requested_ext}"
+                    else:
+                        target_name = (requested_name if len(downloaded_files) == 1 else f"{requested_name}_{index}") + old_ext
+                    new_path = os.path.join(os.path.dirname(old_path), target_name)
+                    if os.path.abspath(old_path) != os.path.abspath(new_path):
+                        if os.path.exists(new_path):
+                            os.remove(new_path)
+                        os.replace(old_path, new_path)
+                    renamed_files.append(new_path)
+                downloaded_files = renamed_files
 
         start_time = time.time()
         last_upload_update = 0
@@ -1834,7 +1857,19 @@ async def process_download(client, status_msg, user_id, user_name, url, custom_n
             if quality != 'mp3' and file_path and os.path.exists(file_path):
                 duration, width, height = get_video_info(file_path)
 
-            if quality == 'mp3' or USER_FILE_MODES.get(user_id, "video") == "document":
+            if quality == 'mp3':
+                # Send YouTube MP3 downloads as Telegram audio, not as a generic document.
+                audio_title = os.path.splitext(os.path.basename(file_path))[0]
+                sent_msg = await client.send_audio(
+                    chat_id=status_msg.chat.id,
+                    audio=file_path,
+                    caption=caption,
+                    title=audio_title[:64],
+                    thumb=valid_thumb,
+                    progress=upload_progress,
+                    reply_to_message_id=status_msg.reply_to_message_id
+                )
+            elif USER_FILE_MODES.get(user_id, "video") == "document":
                 sent_msg = await client.send_document(
                     chat_id=status_msg.chat.id,
                     document=file_path,
