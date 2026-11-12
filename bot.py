@@ -21,8 +21,7 @@ import yt_dlp
 from aiohttp import web
 from leech import register_leech_handlers
 from youtube_formats import (
-    available_video_heights,
-    compatible_video_formats,
+    supported_quality_heights,
     extract_info_with_cookie_fallback,
     selected_video_height,
     youtube_format_for_height,
@@ -165,15 +164,6 @@ def human_bytes(size):
         size /= 1024
         i += 1
     return f"{size:.2f} {units[i]}"
-
-def get_format_size(f, duration):
-    size = f.get('filesize') or f.get('filesize_approx')
-    if size:
-        return int(size)
-    tbr = f.get('tbr') or 0
-    if tbr and duration:
-        return int((tbr * 1000 * duration) / 8)
-    return 0
 
 def get_youtube_cookie_file():
     # instagram_com_cookies.txt is for Instagram and should not be sent to YouTube.
@@ -1439,53 +1429,21 @@ async def auto_media_link(client: Client, message: Message):
                 formats = info.get('formats', [])
                 title = info.get('title', 'YouTube Video')
                 thumbnail_url = info.get('thumbnail')
-                duration = info.get('duration') or 0
 
-                resolutions = available_video_heights(formats)
+                # Offer only the requested standard resolutions that actually
+                # exist in the source. This avoids duplicate/phantom choices.
+                resolutions = supported_quality_heights(formats)
                 quality_buttons = []
 
-                audio_formats = [
-                    f for f in formats
-                    if f.get('vcodec') == 'none' and f.get('acodec') not in (None, 'none')
-                ]
-                best_audio_size = 0
-                if audio_formats:
-                    best_audio = max(audio_formats, key=lambda f: f.get('abr') or f.get('tbr') or 0)
-                    best_audio_size = get_format_size(best_audio, duration)
-
                 for res in resolutions:
-                    matching_formats = compatible_video_formats(formats, res)
-
-                    if not matching_formats:
-                        continue
-
-                    selected = max(
-                        matching_formats,
-                        key=lambda f: (
-                            f.get('height') or 0,
-                            f.get('tbr') or 0,
-                            get_format_size(f, duration),
-                        )
-                    )
-
-                    video_size = get_format_size(selected, duration)
-
-                    if selected.get('acodec') == 'none':
-                        total_size = video_size + best_audio_size if video_size and best_audio_size else 0
-                    else:
-                        total_size = video_size
-
-                    size_str = human_bytes(total_size) if total_size > 0 else "Size unavailable"
-
                     label = (
-                        f"Up to {res}p (2K)" if res == 1440
-                        else f"Up to {res}p (4K)" if res == 2160
-                        else f"Up to {res}p"
+                        "1440p (2K)" if res == 1440
+                        else "2160p (4K)" if res == 2160
+                        else f"{res}p"
                     )
-
                     quality_buttons.append([
                         InlineKeyboardButton(
-                            f"📥 {label} [{size_str}]",
+                            f"📥 {label}",
                             callback_data=f"ytdl_{res}"
                         )
                     ])

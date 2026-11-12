@@ -5,6 +5,9 @@ class NoCompatibleFormatError(ValueError):
     """Raised when a requested maximum height has no playable video format."""
 
 
+SUPPORTED_VIDEO_HEIGHTS = (144, 240, 360, 480, 576, 720, 1080, 1440, 2160)
+
+
 def extract_info_with_cookie_fallback(yt_dlp_module, url, options, download=False):
     """Retry metadata/download once without a cookie file if cookie auth fails."""
     try:
@@ -70,3 +73,9 @@ def selected_video_height(info):
     if heights:
         return max(heights)
     return info.get("height")
+
+
+def supported_quality_heights(formats):
+    """Return only requested standard resolutions present in source formats."""
+    available = set(available_video_heights(formats))
+    return [height for height in SUPPORTED_VIDEO_HEIGHTS if height in available]
