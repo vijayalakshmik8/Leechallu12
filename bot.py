@@ -21,6 +21,7 @@ import yt_dlp
 from aiohttp import web
 from leech import register_leech_handlers
 from youtube_formats import (
+    SUPPORTED_VIDEO_HEIGHTS,
     supported_quality_heights,
     extract_info_with_cookie_fallback,
     selected_video_height,
@@ -1427,9 +1428,11 @@ async def auto_media_link(client: Client, message: Message):
                 title = info.get('title', 'YouTube Video')
                 thumbnail_url = info.get('thumbnail')
 
-                # Offer only the requested standard resolutions that actually
-                # exist in the source. This avoids duplicate/phantom choices.
-                resolutions = supported_quality_heights(formats)
+                # Always show the complete standard quality menu. The selected
+                # resolution is treated as a maximum height by yt-dlp, so a
+                # source without an exact tier uses its best available lower
+                # resolution (for example, 576p can fall back to 480p).
+                resolutions = list(SUPPORTED_VIDEO_HEIGHTS)
                 quality_buttons = []
 
                 for res in resolutions:
@@ -1719,7 +1722,7 @@ async def process_download(client, status_msg, user_id, user_name, url, custom_n
         # HTTP/CDN links as well as extractor-supported links.
         if custom_name:
             requested_name = os.path.basename(str(custom_name).strip())
-            requested_name = re.sub(r'[\\x00-\\x1f<>:"/\\\\|?*]', "_", requested_name).strip(" .")
+            requested_name = re.sub(r'[\x00-\x1f<>:"/\\|?*]', "_", requested_name).strip(" .")
             if requested_name:
                 renamed_files = []
                 for index, old_path in enumerate(downloaded_files, start=1):
@@ -1736,6 +1739,8 @@ async def process_download(client, status_msg, user_id, user_name, url, custom_n
                         os.replace(old_path, new_path)
                     renamed_files.append(new_path)
                 downloaded_files = renamed_files
+                # Keep the caption title in sync with the actual uploaded filename.
+                original_title = os.path.splitext(os.path.basename(downloaded_files[0]))[0]
 
         start_time = time.time()
         last_upload_update = 0

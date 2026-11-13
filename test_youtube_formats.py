@@ -3,6 +3,7 @@ from types import SimpleNamespace
 
 from youtube_formats import (
     NoCompatibleFormatError,
+    SUPPORTED_VIDEO_HEIGHTS,
     available_video_heights,
     compatible_video_formats,
     extract_info_with_cookie_fallback,
@@ -49,9 +50,17 @@ class YoutubeFormatTests(unittest.TestCase):
         formats = [video(360), video(360), video(1080), {"height": 720, "vcodec": "none", "acodec": "opus"}]
         self.assertEqual(available_video_heights(formats), [360, 1080])
 
-    def test_menu_only_offers_requested_standard_heights_that_exist(self):
-        formats = [video(144), video(240), video(432), video(576), video(720), video(1440), video(2160)]
-        self.assertEqual(supported_quality_heights(formats), [144, 240, 576, 720, 1440, 2160])
+    def test_complete_standard_quality_menu_includes_576_2k_and_4k(self):
+        self.assertEqual(
+            list(SUPPORTED_VIDEO_HEIGHTS),
+            [144, 240, 360, 480, 576, 720, 1080, 1440, 2160],
+        )
+
+    def test_higher_tier_requests_keep_the_requested_height_cap(self):
+        formats = [video(480), video(720), video(1080), video(2160)]
+        for requested in (576, 1440, 2160):
+            selector = youtube_format_for_height(formats, requested)
+            self.assertIn(f"height<={requested}", selector)
 
     def test_720_request_excludes_higher_formats(self):
         formats = [video(480), video(720), video(1080), video(2160)]
