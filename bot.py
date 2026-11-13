@@ -26,6 +26,7 @@ from youtube_formats import (
     extract_info_with_cookie_fallback,
     selected_video_height,
     youtube_format_for_height,
+    estimate_quality_size,
 )
 
 # Logging Setup
@@ -1441,9 +1442,16 @@ async def auto_media_link(client: Client, message: Message):
                         else "2160p (4K)" if res == 2160
                         else f"{res}p"
                     )
+                    estimated_bytes, is_exact_size = estimate_quality_size(
+                        formats, res, info.get("duration"), can_merge=bool(shutil.which("ffmpeg"))
+                    )
+                    if estimated_bytes is not None:
+                        size_label = f"{' ' if is_exact_size else ' ~'}{estimated_bytes / (1024 * 1024):.2f} MB"
+                    else:
+                        size_label = " · Size N/A"
                     quality_buttons.append([
                         InlineKeyboardButton(
-                            f"📥 {label}",
+                            f"📥 {label}{size_label}",
                             callback_data=f"ytdl_{res}"
                         )
                     ])
@@ -1556,16 +1564,18 @@ async def process_download(client, status_msg, user_id, user_name, url, custom_n
         cookie_file_path = get_youtube_cookie_file()
 
         try:
-            with yt_dlp.YoutubeDL({'quiet': True, 'skip_download': True, 'nocheckcertificate': True, 'cookiefile': cookie_file_path}) as ydl_thumb:
-                info_thumb = ydl_thumb.extract_info(url, download=False)
-                thumbnail_url = info_thumb.get('thumbnail')
-                if not thumbnail_url and 'thumbnails' in info_thumb:
-                    thumbnails = info_thumb.get('thumbnails', [])
-                    if thumbnails:
-                        thumbnail_url = thumbnails[-1].get('url')
-                
-                if thumbnail_url:
-                    yt_thumb_path = download_youtube_thumbnail(thumbnail_url, user_id)
+            def fetch_thumbnail_metadata():
+                with yt_dlp.YoutubeDL({'quiet': True, 'skip_download': True, 'nocheckcertificate': True, 'cookiefile': cookie_file_path}) as ydl_thumb:
+                    return ydl_thumb.extract_info(url, download=False)
+
+            info_thumb = await asyncio.to_thread(fetch_thumbnail_metadata)
+            thumbnail_url = info_thumb.get('thumbnail')
+            if not thumbnail_url and 'thumbnails' in info_thumb:
+                thumbnails = info_thumb.get('thumbnails', [])
+                if thumbnails:
+                    thumbnail_url = thumbnails[-1].get('url')
+            if thumbnail_url:
+                yt_thumb_path = await asyncio.to_thread(download_youtube_thumbnail, thumbnail_url, user_id)
         except Exception as thumb_err:
             logging.error(f"Error pre-extracting thumbnail: {thumb_err}")
 
@@ -1597,7 +1607,11 @@ async def process_download(client, status_msg, user_id, user_name, url, custom_n
                                            f"📦 **Downloaded:** `{human_bytes(downloaded)}`"
                     
                     try:
-                        client.loop.create_task(status_msg.edit_text(progress_str, reply_markup=cancel_keyboard))
+                        client.loop.call_soon_threadsafe(
+                            lambda message_text=progress_str: asyncio.create_task(
+                                status_msg.edit_text(message_text, reply_markup=cancel_keyboard)
+                            )
+                        )
                     except Exception:
                         pass
 
@@ -1656,61 +1670,68 @@ async def process_download(client, status_msg, user_id, user_name, url, custom_n
                 'merge_output_format': 'mp4',
             }
 
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            info_dict = ydl.extract_info(url, download=True)
-            
-            if 'entries' in info_dict:
-                entries_list = info_dict['entries']
-                total_media_count = len(entries_list)
-                if quality == 'photo':
-                    try:
-                        await status_msg.edit_text(f"🖼️ **Total Photos: {total_media_count}**\n🔄 Downloading and uploading...", reply_markup=cancel_keyboard)
-                    except Exception:
-                        pass
+        def run_ytdlp_download():
+            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                return ydl.extract_info(url, download=True)
 
-                for entry in entries_list:
-                    if entry:
-                        p = ydl.prepare_filename(entry)
-                        if os.path.exists(p):
-                            downloaded_files.append(p)
-                        else:
-                            for ext_c in ['.jpg', '.jpeg', '.png', '.webp', '.mp4', '.mkv']:
-                                cand = os.path.splitext(p)[0] + ext_c
-                                if os.path.exists(cand) and cand not in downloaded_files:
-                                    downloaded_files.append(cand)
-                                    break
-                if not downloaded_files and 'requested_downloads' in info_dict:
-                    for rd in info_dict['requested_downloads']:
-                        if 'filepath' in rd and os.path.exists(rd['filepath']):
-                            downloaded_files.append(rd['filepath'])
-            
-            if not downloaded_files:
-                file_path = ydl.prepare_filename(info_dict)
-                if quality == 'mp3':
-                    file_path = os.path.splitext(file_path)[0] + ".mp3"
-                elif quality == 'photo' and not os.path.exists(file_path):
-                    for ext_candidate in ['.jpg', '.jpeg', '.png', '.webp']:
-                        candidate = os.path.splitext(file_path)[0] + ext_candidate
-                        if os.path.exists(candidate):
-                            file_path = candidate
-                            break
-                if os.path.exists(file_path):
-                    downloaded_files.append(file_path)
+        info_dict = await asyncio.to_thread(run_ytdlp_download)
 
-            original_title = (
-                os.path.splitext(os.path.basename(downloaded_files[0]))[0]
-                if custom_name and downloaded_files
-                else info_dict.get('title', 'Media')
-            )
+        def prepare_download_filename(entry_info):
+            with yt_dlp.YoutubeDL(ydl_opts) as filename_ydl:
+                return filename_ydl.prepare_filename(entry_info)
 
-            if not yt_thumb_path:
-                thumb_url_fallback = info_dict.get('thumbnail')
-                if not thumb_url_fallback and 'thumbnails' in info_dict:
-                    thumbs_list = info_dict.get('thumbnails', [])
-                    if thumbs_list:
-                        thumb_url_fallback = thumbs_list[-1].get('url')
-                if thumb_url_fallback:
-                    yt_thumb_path = download_youtube_thumbnail(thumb_url_fallback, user_id)
+        if 'entries' in info_dict:
+            entries_list = info_dict['entries']
+            total_media_count = len(entries_list)
+            if quality == 'photo':
+                try:
+                    await status_msg.edit_text(f"🖼️ **Total Photos: {total_media_count}**\n🔄 Downloading and uploading...", reply_markup=cancel_keyboard)
+                except Exception:
+                    pass
+
+            for entry in entries_list:
+                if entry:
+                    p = prepare_download_filename(entry)
+                    if os.path.exists(p):
+                        downloaded_files.append(p)
+                    else:
+                        for ext_c in ['.jpg', '.jpeg', '.png', '.webp', '.mp4', '.mkv']:
+                            cand = os.path.splitext(p)[0] + ext_c
+                            if os.path.exists(cand) and cand not in downloaded_files:
+                                downloaded_files.append(cand)
+                                break
+            if not downloaded_files and 'requested_downloads' in info_dict:
+                for rd in info_dict['requested_downloads']:
+                    if 'filepath' in rd and os.path.exists(rd['filepath']):
+                        downloaded_files.append(rd['filepath'])
+        
+        if not downloaded_files:
+            file_path = prepare_download_filename(info_dict)
+            if quality == 'mp3':
+                file_path = os.path.splitext(file_path)[0] + ".mp3"
+            elif quality == 'photo' and not os.path.exists(file_path):
+                for ext_candidate in ['.jpg', '.jpeg', '.png', '.webp']:
+                    candidate = os.path.splitext(file_path)[0] + ext_candidate
+                    if os.path.exists(candidate):
+                        file_path = candidate
+                        break
+            if os.path.exists(file_path):
+                downloaded_files.append(file_path)
+
+        original_title = (
+            os.path.splitext(os.path.basename(downloaded_files[0]))[0]
+            if custom_name and downloaded_files
+            else info_dict.get('title', 'Media')
+        )
+
+        if not yt_thumb_path:
+            thumb_url_fallback = info_dict.get('thumbnail')
+            if not thumb_url_fallback and 'thumbnails' in info_dict:
+                thumbs_list = info_dict.get('thumbnails', [])
+                if thumbs_list:
+                    thumb_url_fallback = thumbs_list[-1].get('url')
+            if thumb_url_fallback:
+                yt_thumb_path = download_youtube_thumbnail(thumb_url_fallback, user_id)
 
         if user_id in CANCEL_REQUESTS:
             raise Exception("Task cancelled by user/admin.")
@@ -1806,7 +1827,7 @@ async def process_download(client, status_msg, user_id, user_name, url, custom_n
             def upload_progress(current, total):
                 nonlocal last_upload_update
                 if user_id in CANCEL_REQUESTS:
-                    return
+                    raise RuntimeError("Task cancelled by user/admin.")
 
                 current_time = time.time()
                 if current_time - last_upload_update > 3 or current == total:

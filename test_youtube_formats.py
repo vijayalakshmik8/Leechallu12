@@ -7,6 +7,7 @@ from youtube_formats import (
     available_video_heights,
     compatible_video_formats,
     extract_info_with_cookie_fallback,
+    estimate_quality_size,
     selected_video_height,
     supported_quality_heights,
     youtube_format_for_height,
@@ -100,6 +101,28 @@ class YoutubeFormatTests(unittest.TestCase):
         formats = [video(720), {"vcodec": "none", "acodec": "opus"}]
         with self.assertRaisesRegex(NoCompatibleFormatError, "FFmpeg is unavailable"):
             youtube_format_for_height(formats, 720, can_merge=False)
+
+    def test_quality_size_uses_selected_video_and_audio_source_sizes(self):
+        formats = [
+            {**video(720), "ext": "mp4", "filesize": 80 * 1024 * 1024},
+            {"height": None, "vcodec": "none", "acodec": "mp4a", "ext": "m4a", "filesize": 10 * 1024 * 1024},
+        ]
+        size, exact = estimate_quality_size(formats, 720, duration=120)
+        self.assertEqual(size, 90 * 1024 * 1024)
+        self.assertTrue(exact)
+
+    def test_quality_size_marks_approximate_metadata(self):
+        formats = [
+            {**video(480, acodec="mp4a"), "ext": "mp4", "filesize_approx": 25 * 1024 * 1024},
+        ]
+        size, exact = estimate_quality_size(formats, 576, duration=60)
+        self.assertEqual(size, 25 * 1024 * 1024)
+        self.assertFalse(exact)
+
+    def test_quality_size_is_unavailable_when_no_compatible_video_exists(self):
+        size, exact = estimate_quality_size([video(1080)], 576, duration=60)
+        self.assertIsNone(size)
+        self.assertFalse(exact)
 
 
 if __name__ == "__main__":
