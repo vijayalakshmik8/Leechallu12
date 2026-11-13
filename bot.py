@@ -29,6 +29,9 @@ from youtube_formats import (
     estimate_quality_size,
 )
 
+# Added cloud-link downloader engine (GoFile).
+from gofile_engine import GoFile
+
 # Logging Setup
 logging.basicConfig(level=logging.INFO)
 
@@ -1366,6 +1369,373 @@ async def process_telegram_link(client, status_msg, user_id, user_name, link, cu
                 del ACTIVE_TASKS[user_id]
 
 
+
+
+# ===================== ADDED: TERABOX + GOFILE DOWNLOAD SUPPORT =====================
+# These additions are intentionally separate from the existing YouTube/Leech pipeline.
+
+CLOUD_COOKIE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "terabox.app_cookies.txt")
+CLOUD_LINK_RE = re.compile(r"https?://[^\s<>]+", re.IGNORECASE)
+GOFILE_LINK_RE = re.compile(r"(?:www\.)?gofile\.io/d/[A-Za-z0-9-]+", re.IGNORECASE)
+TERABOX_HOST_MARKERS = (
+    "terabox.com", "terabox.app", "teraboxapp.com", "1024tera.com",
+    "1024terabox.com", "4funbox.com", "mirrobox.com",
+    "teraboxlink.com", "teraboxshare.com",
+)
+
+def identify_cloud_link(text):
+    """Return (service, url) for the first supported TeraBox/GoFile URL."""
+    for raw_url in CLOUD_LINK_RE.findall(text or ""):
+        url = raw_url.rstrip(".,;:!?)\\]}>")
+        lowered = url.lower()
+        if GOFILE_LINK_RE.search(url):
+            return "gofile", url
+        if any(host in lowered for host in TERABOX_HOST_MARKERS):
+            return "terabox", url
+    return None, None
+
+
+def read_terabox_cookie_file(cookie_path=CLOUD_COOKIE_FILE):
+    """
+    Read a Netscape-format browser cookie export.
+    TeraboxDL documents lang + ndus as the required cookie pair.
+    Never log or display cookie values.
+    """
+    if not os.path.isfile(cookie_path):
+        raise RuntimeError(
+            f"TeraBox cookie file not found: {os.path.basename(cookie_path)}"
+        )
+
+    cookies = {}
+    with open(cookie_path, "r", encoding="utf-8", errors="replace") as cookie_file:
+        for line in cookie_file:
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            parts = line.split("\t")
+            if len(parts) >= 7:
+                cookie_name = parts[5].strip()
+                cookie_value = parts[6].strip()
+                if cookie_name and cookie_value:
+                    cookies[cookie_name] = cookie_value
+            elif "=" in line and not line.startswith("#"):
+                name, value = line.split("=", 1)
+                cookies[name.strip()] = value.strip().rstrip(";")
+
+    lang = cookies.get("lang")
+    ndus = cookies.get("ndus")
+    if not lang or not ndus:
+        missing = []
+        if not lang:
+            missing.append("lang")
+        if not ndus:
+            missing.append("ndus")
+        raise RuntimeError(
+            "TeraBox cookie export is missing required cookie(s): "
+            + ", ".join(missing)
+            + ". Export cookies again from a logged-in TeraBox browser session."
+        )
+    return f"lang={lang}; ndus={ndus};"
+
+
+def _cloud_files_in(folder):
+    found = []
+    for current_root, dirs, files in os.walk(folder):
+        dirs.sort()
+        for filename in sorted(files):
+            if filename.endswith(".part"):
+                continue
+            file_path = os.path.join(current_root, filename)
+            if os.path.isfile(file_path) and os.path.getsize(file_path) > 0:
+                found.append(file_path)
+    return found
+
+
+def _download_gofile_sync(url, folder, cancel_event, progress_callback, file_progress_callback):
+    content_id = GoFile.parse_content_id(url)
+    if not content_id:
+        raise RuntimeError("Invalid GoFile share link.")
+
+    downloader = GoFile()  # Guest/free account; no Premium token is supplied.
+    downloader.execute(
+        dir=folder,
+        content_id=content_id,
+        cancel_event=cancel_event,
+        progress_callback=progress_callback,
+        file_progress_callback=file_progress_callback,
+        retry_attempts=1,
+        strip_emojis=False,
+    )
+    if cancel_event.is_set():
+        raise RuntimeError("Task cancelled by user.")
+    files = _cloud_files_in(folder)
+    if not files:
+        raise RuntimeError(
+            "GoFile returned no downloadable files. The link may be unavailable, "
+            "password-protected, expired, or blocked by GoFile."
+        )
+    return files
+
+
+def _download_terabox_sync(url, folder, cancel_event, progress_callback):
+    try:
+        from TeraboxDL import TeraboxDL
+    except ImportError as exc:
+        raise RuntimeError(
+            "TeraBox downloader is not installed. Run: pip install terabox-downloader"
+        ) from exc
+
+    cookie = read_terabox_cookie_file()
+    terabox = TeraboxDL(cookie)
+    file_info = terabox.get_file_info(url)
+    if not isinstance(file_info, dict) or file_info.get("error"):
+        reason = file_info.get("error", "Unable to read TeraBox share link.") if isinstance(file_info, dict) else "Invalid TeraBox response."
+        raise RuntimeError(str(reason))
+
+    def terabox_progress(downloaded, total_size, percentage):
+        if cancel_event.is_set():
+            raise RuntimeError("Task cancelled by user.")
+        if progress_callback:
+            progress_callback(
+                int(max(0, min(100, percentage))),
+                file_info.get("file_name", "TeraBox file"),
+                int(downloaded or 0),
+                int(total_size or 0),
+            )
+
+    result = terabox.download(
+        file_info,
+        save_path=folder,
+        callback=terabox_progress,
+    )
+    if cancel_event.is_set():
+        raise RuntimeError("Task cancelled by user.")
+    if not isinstance(result, dict) or result.get("error"):
+        reason = result.get("error", "TeraBox download failed.") if isinstance(result, dict) else "Invalid TeraBox download response."
+        raise RuntimeError(str(reason))
+
+    file_path = result.get("file_path")
+    if not file_path or not os.path.isfile(file_path) or os.path.getsize(file_path) <= 0:
+        raise RuntimeError("TeraBox did not create a valid downloaded file.")
+    return [file_path]
+
+
+async def process_cloud_link(client, message, user_id, user_name, service, url):
+    """Download a TeraBox/GoFile link, show progress/cancel, then upload results."""
+    import threading
+
+    ACTIVE_TASKS[user_id] = ACTIVE_TASKS.get(user_id, 0) + 1
+    task_dir = tempfile.mkdtemp(prefix=f"{service}_{user_id}_", dir="downloads" if os.path.isdir("downloads") else None)
+    cancel_event = threading.Event()
+    loop = asyncio.get_running_loop()
+    last_progress_update = [0.0]
+    downloaded_files = []
+
+    cancel_keyboard = InlineKeyboardMarkup([
+        [InlineKeyboardButton("✖️ Task Cancel", callback_data=f"cancel_dl_{user_id}")]
+    ])
+    status_msg = await message.reply_text(
+        f"🔗 **{service.upper()} Link Detected!**\n\n📥 Preparing download...",
+        quote=True,
+        reply_markup=cancel_keyboard,
+    )
+
+    def schedule_status(text):
+        now = time.time()
+        if now - last_progress_update[0] < 2.5:
+            return
+        last_progress_update[0] = now
+        def _schedule():
+            asyncio.create_task(status_msg.edit_text(text, reply_markup=cancel_keyboard))
+        try:
+            loop.call_soon_threadsafe(_schedule)
+        except RuntimeError:
+            pass
+
+    def gofile_file_progress(file_path, percent, size=None, **kwargs):
+        if user_id in CANCEL_REQUESTS:
+            cancel_event.set()
+        if percent < 0:
+            detail = "Retrying download..."
+        else:
+            detail = f"📁 **File:** `{os.path.basename(file_path)}`\n📊 **Progress:** `{percent}%`"
+            if size:
+                detail += f"\n📦 **Size:** `{human_bytes(int(size))}`"
+        schedule_status(f"📥 **Downloading from GoFile...**\n\n{detail}")
+
+    def gofile_progress(percent):
+        if user_id in CANCEL_REQUESTS:
+            cancel_event.set()
+        schedule_status(f"📥 **Downloading from GoFile...**\n\n📊 **Progress:** `{percent}%`")
+
+    def terabox_progress(percent, filename, downloaded, total):
+        if user_id in CANCEL_REQUESTS:
+            cancel_event.set()
+        detail = f"📁 **File:** `{filename}`\n📊 **Progress:** `{percent}%`"
+        if total:
+            detail += f"\n📦 **Size:** `{human_bytes(downloaded)} / {human_bytes(total)}`"
+        schedule_status(f"📥 **Downloading from TeraBox...**\n\n{detail}")
+
+    try:
+        os.makedirs("downloads", exist_ok=True)
+        await status_msg.edit_text(
+            f"📥 **Downloading from {service.upper()}...**",
+            reply_markup=cancel_keyboard,
+        )
+
+        if service == "gofile":
+            worker = asyncio.create_task(asyncio.to_thread(
+                _download_gofile_sync,
+                url,
+                task_dir,
+                cancel_event,
+                gofile_progress,
+                gofile_file_progress,
+            ))
+        else:
+            worker = asyncio.create_task(asyncio.to_thread(
+                _download_terabox_sync,
+                url,
+                task_dir,
+                cancel_event,
+                terabox_progress,
+            ))
+
+        while not worker.done():
+            if user_id in CANCEL_REQUESTS:
+                cancel_event.set()
+            await asyncio.sleep(0.25)
+
+        downloaded_files = await worker
+        if user_id in CANCEL_REQUESTS or cancel_event.is_set():
+            raise RuntimeError("Task cancelled by user.")
+
+        await status_msg.edit_text(
+            f"✅ **Download Completed!**\n"
+            f"📁 Files: `{len(downloaded_files)}`\n\n"
+            "📤 Preparing Telegram upload...",
+            reply_markup=cancel_keyboard,
+        )
+
+        sent_count = 0
+        for index, file_path in enumerate(downloaded_files, start=1):
+            if user_id in CANCEL_REQUESTS:
+                raise RuntimeError("Task cancelled by user.")
+
+            filename = os.path.basename(file_path)
+            file_size = os.path.getsize(file_path)
+            caption = (
+                f"<b>{html.escape(filename)}</b>\n\n"
+                f"📦 <b>Size:</b> {human_bytes(file_size)}\n"
+                f"👤 <b>Task By:</b> {html.escape(user_name)} (<code>{user_id}</code>)\n"
+                f"🔗 <b>Link:</b> {html.escape(url)}"
+                f"{get_branding_footer()}"
+            )
+            upload_last_update = [0.0]
+
+            def upload_progress(current, total):
+                if user_id in CANCEL_REQUESTS:
+                    raise RuntimeError("Task cancelled by user.")
+                now = time.time()
+                if now - upload_last_update[0] >= 3 or current == total:
+                    upload_last_update[0] = now
+                    percent = (current / total * 100) if total else 0
+                    progress_text = (
+                        f"📤 **Uploading {index}/{len(downloaded_files)}...**\n\n"
+                        f"📁 `{filename}`\n"
+                        f"📊 **Progress:** `{percent:.1f}%`\n"
+                        f"📦 **Size:** `{human_bytes(current)} / {human_bytes(total)}`"
+                    )
+                    try:
+                        client.loop.call_soon_threadsafe(
+                            lambda text=progress_text: asyncio.create_task(
+                                status_msg.edit_text(text, reply_markup=cancel_keyboard)
+                            )
+                        )
+                    except Exception:
+                        pass
+
+            extension = os.path.splitext(filename)[1].lower()
+            video_extensions = {".mp4", ".mkv", ".mov", ".avi", ".webm", ".m4v"}
+            image_extensions = {".jpg", ".jpeg", ".png", ".webp"}
+
+            if extension in video_extensions and USER_FILE_MODES.get(user_id, "video") != "document":
+                duration, width, height = (0, 0, 0)
+                thumb = None
+                try:
+                    duration, width, height = get_video_info(file_path)
+                    thumb = generate_thumbnail(file_path, user_id)
+                except Exception:
+                    thumb = None
+                sent_msg = await client.send_video(
+                    chat_id=message.chat.id,
+                    video=file_path,
+                    caption=caption,
+                    duration=duration,
+                    width=width,
+                    height=height,
+                    thumb=thumb if thumb and os.path.exists(thumb) else None,
+                    progress=upload_progress,
+                    reply_to_message_id=message.id,
+                )
+                if thumb and os.path.exists(thumb):
+                    try:
+                        os.remove(thumb)
+                    except Exception:
+                        pass
+            elif extension in image_extensions:
+                sent_msg = await client.send_document(
+                    chat_id=message.chat.id,
+                    document=file_path,
+                    caption=caption,
+                    progress=upload_progress,
+                    reply_to_message_id=message.id,
+                )
+            else:
+                sent_msg = await client.send_document(
+                    chat_id=message.chat.id,
+                    document=file_path,
+                    caption=caption,
+                    progress=upload_progress,
+                    reply_to_message_id=message.id,
+                )
+
+            try:
+                if sent_msg:
+                    await sent_msg.copy(chat_id=DATABASE_CHANNEL_ID)
+            except Exception as db_error:
+                logging.error("Cloud download database copy failed: %s", db_error)
+
+            sent_count += 1
+
+        await status_msg.edit_text(
+            f"✅ **{service.upper()} Download Finished!**\n"
+            f"📥 Downloaded: `{len(downloaded_files)}`\n"
+            f"📤 Uploaded: `{sent_count}`"
+        )
+
+    except Exception as error:
+        if user_id in CANCEL_REQUESTS or cancel_event.is_set() or "cancel" in str(error).lower():
+            await status_msg.edit_text("❌ **Task Cancelled.**")
+        else:
+            logging.exception("%s download failed", service.upper())
+            await status_msg.edit_text(
+                f"❌ **{service.upper()} Download Failed!**\n\n"
+                f"**Reason:** `{html.escape(str(error)[:700])}`"
+            )
+    finally:
+        cancel_event.set()
+        shutil.rmtree(task_dir, ignore_errors=True)
+        CANCEL_REQUESTS.discard(user_id)
+        if user_id in ACTIVE_TASKS:
+            ACTIVE_TASKS[user_id] -= 1
+            if ACTIVE_TASKS[user_id] <= 0:
+                del ACTIVE_TASKS[user_id]
+
+
+# ===================== END ADDED CLOUD DOWNLOAD SUPPORT =====================
+
+
 # --- YouTube Link Detection & Accurate Quality + Original MB Size ---
 @app.on_message(filters.regex(r'https?://[^\s]+|magnet:\?xt=urn:btih:[a-zA-Z0-9]+') & (filters.group | filters.private))
 async def auto_media_link(client: Client, message: Message):
@@ -1381,6 +1751,18 @@ async def auto_media_link(client: Client, message: Message):
     url = message.text.strip()
 
     if "t.me/" in url or "telegram.me/" in url:
+        return
+
+    cloud_service, cloud_url = identify_cloud_link(url)
+    if cloud_service:
+        await process_cloud_link(
+            client,
+            message,
+            user_id,
+            message.from_user.first_name,
+            cloud_service,
+            cloud_url,
+        )
         return
 
     USER_YTDL_LINKS[user_id] = url
