@@ -2552,8 +2552,8 @@ async def main():
     print("🤖 Bot Started Successfully...")
     await idle()
 
+# Register leech command handlers before the bot starts.
+register_leech_handlers(app)
+
 if __name__ == "__main__":
     app.run(main())
-
-# Register leech command handlers
-register_leech_handlers(app)
