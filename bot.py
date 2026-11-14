@@ -2554,7 +2554,7 @@ async def handle_new_name(client, message: Message):
                 f"`{DEFAULT_RELEASE_TAG}`"
             )
             return
-        if len(new_tag) > 80 or any(ch in new_tag for ch in "\\r\\n"):
+        if len(new_tag) > 80 or any(ch in new_tag for ch in "\r\n"):
             await message.reply_text("❌ Tag must be a single line and no longer than 80 characters.")
             return
         USER_RELEASE_TAGS[user_id] = new_tag
