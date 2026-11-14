@@ -134,6 +134,94 @@ def add_release_tag_to_file(file_path, user_id):
     os.rename(file_path, new_path)
     return new_path
 
+
+VIDEO_FORMATS_FILE = "video_formats.json"
+
+def load_video_formats():
+    try:
+        with open(VIDEO_FORMATS_FILE, "r", encoding="utf-8") as file:
+            data = json.load(file)
+            return {
+                int(uid): ("mkv" if str(fmt).lower() == "mkv" else "mp4")
+                for uid, fmt in data.items()
+            }
+    except (FileNotFoundError, json.JSONDecodeError, OSError, ValueError, TypeError):
+        return {}
+
+USER_VIDEO_FORMATS = load_video_formats()
+
+def save_video_formats():
+    temp_path = VIDEO_FORMATS_FILE + ".tmp"
+    with open(temp_path, "w", encoding="utf-8") as file:
+        json.dump({str(uid): fmt for uid, fmt in USER_VIDEO_FORMATS.items()},
+                  file, ensure_ascii=False, indent=2)
+    os.replace(temp_path, VIDEO_FORMATS_FILE)
+
+def get_user_video_format(user_id):
+    return USER_VIDEO_FORMATS.get(user_id, "mkv")
+
+def convert_video_to_user_format(file_path, user_id):
+    """Apply the user's saved MKV/MP4 container to every downloaded video."""
+    if not file_path or not os.path.isfile(file_path):
+        return file_path
+    extension = os.path.splitext(file_path)[1].lower()
+    video_extensions = {".mp4", ".mkv", ".mov", ".avi", ".webm", ".m4v", ".flv", ".ts"}
+    if extension not in video_extensions:
+        return file_path
+
+    target_format = get_user_video_format(user_id)
+    target_extension = "." + target_format
+    if extension == target_extension:
+        return file_path
+
+    ffmpeg = shutil.which("ffmpeg")
+    if not ffmpeg:
+        raise RuntimeError("FFmpeg is required to convert videos to the selected " + target_format.upper() + " format.")
+
+    target_path = os.path.splitext(file_path)[0] + target_extension
+    if os.path.abspath(target_path) == os.path.abspath(file_path):
+        return file_path
+    if os.path.exists(target_path):
+        target_path = os.path.splitext(target_path)[0] + f"_{int(time.time())}" + target_extension
+
+    base_command = [ffmpeg, "-y", "-i", file_path, "-map", "0:v:0", "-map", "0:a?", "-sn"]
+    copy_command = base_command + ["-c", "copy"]
+    if target_format == "mp4":
+        copy_command += ["-movflags", "+faststart"]
+    copy_command += [target_path]
+    result = subprocess.run(copy_command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+
+    if result.returncode != 0:
+        transcode_command = base_command + ["-c:v", "libx264", "-preset", "veryfast", "-crf", "23",
+                                            "-c:a", "aac", "-b:a", "192k"]
+        if target_format == "mp4":
+            transcode_command += ["-movflags", "+faststart"]
+        transcode_command += [target_path]
+        result = subprocess.run(transcode_command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+
+    if result.returncode != 0 or not os.path.isfile(target_path) or os.path.getsize(target_path) == 0:
+        if os.path.exists(target_path):
+            os.remove(target_path)
+        detail = (result.stderr or "Unknown FFmpeg error")[-700:]
+        raise RuntimeError("Could not convert video to " + target_format.upper() + ": " + detail)
+
+    os.remove(file_path)
+    return target_path
+
+def build_user_settings_keyboard(user_id):
+    has_thumb = "Yes 🖼️" if user_id in USER_THUMBNAILS and USER_THUMBNAILS[user_id] else "No ❌"
+    current_mode = USER_FILE_MODES.get(user_id, "video")
+    mode_text = "📹 Video Format" if current_mode == "video" else "📁 Document Format"
+    current_format = get_user_video_format(user_id).upper()
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton(f"Thumbnail Set: {has_thumb}", callback_data="set_thumb")],
+        [InlineKeyboardButton(f"Mode: {mode_text}", callback_data="toggle_mode")],
+        [InlineKeyboardButton("👁️ View Thumbnail", callback_data="view_thumb")],
+        [InlineKeyboardButton("🏷️ Release Tag", callback_data="set_release_tag")],
+        [InlineKeyboardButton(f"📁 Format: {current_format}", callback_data="toggle_video_format")],
+        [InlineKeyboardButton("🗑️ Remove Thumbnail", callback_data="remove_thumb")]
+    ])
+
 USER_YTDL_LINKS = {}
 USER_FILE_MODES = {}
 USER_STATES = {}
@@ -873,17 +961,7 @@ async def usetting_handler(client: Client, message: Message):
         )
         return
 
-    has_thumb = "Yes 🖼️" if user_id in USER_THUMBNAILS and USER_THUMBNAILS[user_id] else "No ❌"
-    current_mode = USER_FILE_MODES.get(user_id, "video")
-    mode_text = "📹 Video Format" if current_mode == "video" else "📁 Document Format"
-    
-    keyboard = InlineKeyboardMarkup([
-        [InlineKeyboardButton(f"Thumbnail Set: {has_thumb}", callback_data="set_thumb")],
-        [InlineKeyboardButton(f"Mode: {mode_text}", callback_data="toggle_mode")],
-        [InlineKeyboardButton("👁️ View Thumbnail", callback_data="view_thumb")],
-        [InlineKeyboardButton("🏷️ Release Tag", callback_data="set_release_tag")],
-        [InlineKeyboardButton("🗑️ Remove Thumbnail", callback_data="remove_thumb")]
-    ])
+    keyboard = build_user_settings_keyboard(user_id)
     
     await message.reply_text(
         "⚙️ **User Personal Settings**\n\n"
@@ -941,6 +1019,17 @@ async def callback_handler(client: Client, callback_query: CallbackQuery):
         await callback_query.answer("Default tag restored!")
         return
 
+    if data == "toggle_video_format":
+        current_format = get_user_video_format(user_id)
+        new_format = "mp4" if current_format == "mkv" else "mkv"
+        USER_VIDEO_FORMATS[user_id] = new_format
+        save_video_formats()
+        await callback_query.message.edit_reply_markup(
+            reply_markup=build_user_settings_keyboard(user_id)
+        )
+        await callback_query.answer(f"Download format changed to {new_format.upper()}.")
+        return
+
     if data == "set_thumb":
         WAITING_FOR_THUMB.add(user_id)
         await callback_query.message.edit_text(
@@ -977,14 +1066,7 @@ async def callback_handler(client: Client, callback_query: CallbackQuery):
         USER_FILE_MODES[user_id] = new_mode
         mode_text = "📹 Video Format" if new_mode == "video" else "📁 Document Format"
         
-        has_thumb = "Yes 🖼️" if user_id in USER_THUMBNAILS and USER_THUMBNAILS[user_id] else "No ❌"
-        keyboard = InlineKeyboardMarkup([
-            [InlineKeyboardButton(f"Thumbnail Set: {has_thumb}", callback_data="set_thumb")],
-            [InlineKeyboardButton(f"Mode: {mode_text}", callback_data="toggle_mode")],
-            [InlineKeyboardButton("👁️ View Thumbnail", callback_data="view_thumb")],
-            [InlineKeyboardButton("🏷️ Release Tag", callback_data="set_release_tag")],
-            [InlineKeyboardButton("🗑️ Remove Thumbnail", callback_data="remove_thumb")]
-        ])
+        keyboard = build_user_settings_keyboard(user_id)
         await callback_query.message.edit_reply_markup(reply_markup=keyboard)
         await callback_query.answer(f"Changed upload mode to {new_mode}!")
 
@@ -1701,6 +1783,7 @@ async def process_cloud_link(client, message, user_id, user_name, service, url):
             if user_id in CANCEL_REQUESTS:
                 raise RuntimeError("Task cancelled by user.")
 
+            file_path = convert_video_to_user_format(file_path, user_id)
             file_path = add_release_tag_to_file(file_path, user_id)
             filename = os.path.basename(file_path)
             file_size = os.path.getsize(file_path)
@@ -2129,7 +2212,7 @@ async def process_download(client, status_msg, user_id, user_name, url, custom_n
             ydl_opts = {
                 **common_ydl_opts,
                 'format': fmt_selector,
-                'merge_output_format': 'mp4',
+                'merge_output_format': get_user_video_format(user_id),
             }
 
         def run_ytdlp_download():
@@ -2241,7 +2324,14 @@ async def process_download(client, status_msg, user_id, user_name, url, custom_n
             actual_height = selected_video_height(quality_info)
             display_quality = f"{actual_height}p" if actual_height else f"Up to {quality}p"
 
-        downloaded_files = [add_release_tag_to_file(path, user_id) for path in downloaded_files]
+        downloaded_files = [
+            add_release_tag_to_file(convert_video_to_user_format(path, user_id), user_id)
+            for path in downloaded_files
+        ]
+        # Keep the displayed title identical to the final uploaded filename (without extension),
+        # including the Release Tag exactly once.
+        if downloaded_files:
+            original_title = os.path.basename(downloaded_files[0])
         file_path_for_size = downloaded_files[0]
         actual_file_size = os.path.getsize(file_path_for_size) if os.path.exists(file_path_for_size) else 0
 
