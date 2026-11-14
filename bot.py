@@ -905,6 +905,7 @@ async def start_handler(client: Client, message: Message):
         f"🌟 **Welcome to Advanced Bot, {user_name}!** 🚀\n\n"
         f"I can help you download videos and audio from Instagram, YouTube, Gofile, M3U8, MP4, MP3, and more.\n\n"
         f"🛠️ **Key Features:**\n"
+        f"• Use -n to rename media.\n"
         f" • Use `-t` to set custom thumbnails.\n"
         f" • Use `/usetting` to configure settings.\n"
         f" • Premium users get unlimited concurrent tasks!\n\n"
