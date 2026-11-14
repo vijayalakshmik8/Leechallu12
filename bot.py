@@ -12,6 +12,7 @@ import glob
 import tempfile
 import shutil
 import html
+import json
 from datetime import datetime, timedelta
 from urllib.parse import urlparse
 from pyrogram import Client, filters, idle
@@ -86,6 +87,53 @@ app = Client("LeechBot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
 
 USER_THUMBNAILS = {}
 WAITING_FOR_THUMB = set()
+WAITING_FOR_RELEASE_TAG = set()
+DEFAULT_RELEASE_TAG = "~𝑨𝑳𝑳𝑼 𝑻𝑽 𝑺𝒆𝒓𝒊𝒂𝒍 @AlluTvSerials"
+RELEASE_TAGS_FILE = "release_tags.json"
+
+def load_release_tags():
+    try:
+        with open(RELEASE_TAGS_FILE, "r", encoding="utf-8") as file:
+            data = json.load(file)
+            return {int(uid): str(tag) for uid, tag in data.items() if str(tag).strip()}
+    except (FileNotFoundError, json.JSONDecodeError, OSError, ValueError, TypeError):
+        return {}
+
+USER_RELEASE_TAGS = load_release_tags()
+
+def save_release_tags():
+    temp_path = RELEASE_TAGS_FILE + ".tmp"
+    with open(temp_path, "w", encoding="utf-8") as file:
+        json.dump({str(uid): tag for uid, tag in USER_RELEASE_TAGS.items()},
+                  file, ensure_ascii=False, indent=2)
+    os.replace(temp_path, RELEASE_TAGS_FILE)
+
+def get_user_release_tag(user_id):
+    return USER_RELEASE_TAGS.get(user_id, DEFAULT_RELEASE_TAG)
+
+def add_release_tag_to_file(file_path, user_id):
+    # Add the user's tag before supported video extensions only.
+    if not file_path or not os.path.isfile(file_path):
+        return file_path
+    stem, extension = os.path.splitext(file_path)
+    if extension.lower() not in {".mp4", ".mkv", ".mov", ".avi", ".webm", ".m4v"}:
+        return file_path
+    tag = get_user_release_tag(user_id).strip()
+    tag = re.sub(r'[\\\\/:*?"<>|]+', "_", tag).strip(" .")
+    if not tag or os.path.basename(stem).endswith(tag):
+        return file_path
+    new_path = f"{stem} {tag}{extension}"
+    if len(os.path.basename(new_path)) > 240:
+        allowed = max(1, 240 - len(os.path.basename(stem)) - len(extension) - 1)
+        new_path = f"{stem} {tag[:allowed]}{extension}"
+    if os.path.abspath(new_path) == os.path.abspath(file_path):
+        return file_path
+    if os.path.exists(new_path):
+        base, ext = os.path.splitext(new_path)
+        new_path = f"{base}_{int(time.time())}{ext}"
+    os.rename(file_path, new_path)
+    return new_path
+
 USER_YTDL_LINKS = {}
 USER_FILE_MODES = {}
 USER_STATES = {}
@@ -833,6 +881,7 @@ async def usetting_handler(client: Client, message: Message):
         [InlineKeyboardButton(f"Thumbnail Set: {has_thumb}", callback_data="set_thumb")],
         [InlineKeyboardButton(f"Mode: {mode_text}", callback_data="toggle_mode")],
         [InlineKeyboardButton("👁️ View Thumbnail", callback_data="view_thumb")],
+        [InlineKeyboardButton("🏷️ Release Tag", callback_data="set_release_tag")],
         [InlineKeyboardButton("🗑️ Remove Thumbnail", callback_data="remove_thumb")]
     ])
     
@@ -863,6 +912,33 @@ async def callback_handler(client: Client, callback_query: CallbackQuery):
             "You must join our update channels below to proceed.",
             reply_markup=await not_joined_keyboard()
         )
+        return
+
+    if data == "set_release_tag":
+        WAITING_FOR_RELEASE_TAG.add(user_id)
+        current_tag = get_user_release_tag(user_id)
+        await callback_query.message.reply_text(
+            "🏷️ **Set Your Personal Release Tag**\\n\\n"
+            f"Current tag: `{current_tag}`\\n\\n"
+            "Send the tag you want to use. It will be added automatically "
+            "before the video extension (.mp4 / .mkv).\\n\\n"
+            "Send `default` to use the bot's default tag again.",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("↩️ Use Default Tag", callback_data="release_tag_default")]
+            ])
+        )
+        await callback_query.answer()
+        return
+
+    if data == "release_tag_default":
+        USER_RELEASE_TAGS.pop(user_id, None)
+        save_release_tags()
+        WAITING_FOR_RELEASE_TAG.discard(user_id)
+        await callback_query.message.edit_text(
+            "✅ **Default Release Tag restored!**\\n\\n"
+            f"`{DEFAULT_RELEASE_TAG}`"
+        )
+        await callback_query.answer("Default tag restored!")
         return
 
     if data == "set_thumb":
@@ -906,6 +982,7 @@ async def callback_handler(client: Client, callback_query: CallbackQuery):
             [InlineKeyboardButton(f"Thumbnail Set: {has_thumb}", callback_data="set_thumb")],
             [InlineKeyboardButton(f"Mode: {mode_text}", callback_data="toggle_mode")],
             [InlineKeyboardButton("👁️ View Thumbnail", callback_data="view_thumb")],
+            [InlineKeyboardButton("🏷️ Release Tag", callback_data="set_release_tag")],
             [InlineKeyboardButton("🗑️ Remove Thumbnail", callback_data="remove_thumb")]
         ])
         await callback_query.message.edit_reply_markup(reply_markup=keyboard)
@@ -1254,6 +1331,8 @@ async def process_telegram_link(client, status_msg, user_id, user_name, link, cu
         else:
             file_title = original_name
 
+        downloaded_file = add_release_tag_to_file(downloaded_file, user_id)
+        file_title = os.path.basename(downloaded_file)
         file_size = os.path.getsize(downloaded_file)
 
         start_time_up = time.time()
@@ -1622,6 +1701,7 @@ async def process_cloud_link(client, message, user_id, user_name, service, url):
             if user_id in CANCEL_REQUESTS:
                 raise RuntimeError("Task cancelled by user.")
 
+            file_path = add_release_tag_to_file(file_path, user_id)
             filename = os.path.basename(file_path)
             file_size = os.path.getsize(file_path)
             caption = (
@@ -2161,6 +2241,7 @@ async def process_download(client, status_msg, user_id, user_name, url, custom_n
             actual_height = selected_video_height(quality_info)
             display_quality = f"{actual_height}p" if actual_height else f"Up to {quality}p"
 
+        downloaded_files = [add_release_tag_to_file(path, user_id) for path in downloaded_files]
         file_path_for_size = downloaded_files[0]
         actual_file_size = os.path.getsize(file_path_for_size) if os.path.exists(file_path_for_size) else 0
 
@@ -2369,6 +2450,32 @@ async def handle_new_name(client, message: Message):
     if user_id in BANNED_USERS:
         return
     
+    if user_id in WAITING_FOR_RELEASE_TAG:
+        new_tag = (message.text or "").strip()
+        WAITING_FOR_RELEASE_TAG.discard(user_id)
+        if not new_tag:
+            await message.reply_text("❌ Please send a non-empty Release Tag.")
+            return
+        if new_tag.lower() == "default":
+            USER_RELEASE_TAGS.pop(user_id, None)
+            save_release_tags()
+            await message.reply_text(
+                "✅ Default Release Tag restored!\\n\\n"
+                f"`{DEFAULT_RELEASE_TAG}`"
+            )
+            return
+        if len(new_tag) > 80 or any(ch in new_tag for ch in "\\r\\n"):
+            await message.reply_text("❌ Tag must be a single line and no longer than 80 characters.")
+            return
+        USER_RELEASE_TAGS[user_id] = new_tag
+        save_release_tags()
+        await message.reply_text(
+            "✅ **Your Release Tag has been saved!**\\n\\n"
+            f"Your tag: `{new_tag}`\\n\\n"
+            "It will be added automatically before the video extension in your downloads."
+        )
+        return
+
     if USER_STATES.get(user_id) == "waiting_for_name":
         new_name = message.text.strip()
         USER_STATES[user_id] = None
@@ -2445,6 +2552,8 @@ async def process_renamed_file(client, status_msg, user_id, user_name, original_
             os.rename(downloaded_file, new_file_path)
             downloaded_file = new_file_path
             
+        downloaded_file = add_release_tag_to_file(downloaded_file, user_id)
+        file_title = os.path.basename(downloaded_file)
         file_size = os.path.getsize(downloaded_file)
 
         start_time = time.time()
